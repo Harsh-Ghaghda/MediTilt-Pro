@@ -752,7 +752,6 @@ const unsigned long STATUS_PRINT_INTERVAL_MS = 500; // how often to print IMU/ro
 
 void printStatus() {
   Serial.print("IMU Roll: ");        Serial.print(roll, 2);
-  Serial.print(" | No. of Rotations: "); Serial.print(rotations);
   Serial.print(" | Current Rotations: "); Serial.print(rotations);
   Serial.print(" | Target Rotations: "); Serial.println(targetRotations);
 }
