@@ -179,7 +179,7 @@ void readEncoder()
 //========================
 void setup()
 {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   Wire.begin(4, 5); // SDA=D2 (GPIO4), SCL=D1 (GPIO5)
 

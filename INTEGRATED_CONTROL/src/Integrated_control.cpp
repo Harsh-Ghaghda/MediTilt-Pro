@@ -1,6 +1,30 @@
-// MediTilt Pro - Merged Controller (ESP32)
-// Priority: Nextion display (blink) > Web dashboard
-// Pins: Serial2 16/17 (Nextion), Wire 4/5 (MPU6050), encoder ADC 36, motor 12/13
+// =====================================================================
+// MediTilt Pro - FULLY MERGED Controller (ESP32)
+//
+// PRIORITY ORDER (highest to lowest):
+//   1. HARDWARE REMOTE  (kill switch > homing > manual jog)
+//   2. NEXTION DISPLAY  (physical touch H-commands + USB blink nav)
+//   3. WEB DASHBOARD    (WiFi AP + REST-ish /api)
+//
+// ===================== READ BEFORE FLASHING =========================
+// (1) MOTOR DIRECTION POLARITY CONFLICT BETWEEN SOURCE FILES:
+//     The remote-only sketch drove DIR_PIN=LOW as "increasing" (this is
+//     the version with the backlash-compensation / creep-speed fixes).
+//     The Nextion+web sketch drove DIR_PIN=HIGH as "increasing" - the
+//     OPPOSITE polarity. This merge keeps the remote sketch's polarity
+//     (LOW = increasing) since it's the more recently debugged version.
+//     VERIFY ON THE BENCH: command a small move from the web dashboard
+//     and from Nextion and confirm the bed actually moves the direction
+//     you expect before trusting either of those paths.
+//
+// (2) GPIO36 (encoder ADC1) + WiFi AP running concurrently is a
+//     previously-diagnosed noise source for you (encoder count
+//     corruption -> "down" direction failures). Merging in the web
+//     dashboard means the AP is now always on next to the encoder read.
+//     A 3-sample median filter was added to readEncoder() as a
+//     mitigation, but this is a patch, not a guarantee - watch
+//     printDebugStatus() output for spurious rotation jumps under load.
+// =====================================================================
 
 #include <Wire.h>
 #include <Arduino.h>
@@ -8,20 +32,17 @@
 #include <WebServer.h>
 #include "calibration_table.h"
 
-// Set to true to test the Nextion-vs-web priority logic without a motor
-// power supply connected. No PWM is actually sent to the driver - every
-// "movement" just prints to Serial instead, so you can watch the
-// arbitration (blink wins, web gets BUSY) purely through the Serial
-// Monitor and the web page. Set back to false once you have real
-// motor power to test actual movement.
+// Set true to test priority/arbitration logic without motor power connected.
 #define SIMULATE_MOTOR false
 
-// Forward declarations (required for PlatformIO/.cpp builds - unlike the
-// Arduino IDE, PlatformIO does not auto-generate these from the .ino scan)
+// ===================================================================
+// FORWARD DECLARATIONS (required for PlatformIO .cpp builds)
+// ===================================================================
 void handleRoot();
 void handleAPI();
 void setBedTarget(float targetAngle);
 long rollToRotations(float targetRoll);
+long applyBacklashCompensation(long rawTarget);
 void updateMotorControl();
 void setupMotor();
 void readEncoder();
@@ -36,11 +57,54 @@ void handleNext();
 void handleSelect();
 void interpretBedCommand(String cmd);
 void applyTouchModeForCurrentPage();
-void printStatus();
+void printDebugStatus();
+byte read74HC165();
+void updateRemoteLED(bool isCommandActive);
+void setupLegMotor();
+void legMotorStop();
+void legMotorDriveUp();
+void legMotorDriveDown();
+void commandLegManual(int dir);
+void commandHeadManual(int dir);
+void commandTiltSim(int dir);
+void haltAllMotorsHard();
+void pollRemote();
+void updateHomingSimulation();
+bool remoteHasPriority();
+bool nextionHasPriority();
+void markRemoteActive();
+void markNextionActive();
 
-// Only 1 motor exists (torso/head section). "head" drives it; foot/leftTilt/
-// rightTilt are UI-only until more motors are added.
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
 
+// ===================================================================
+// PIN MAP (superset of both source sketches - verified no overlaps)
+// ===================================================================
+// I2C (MPU6050):            SDA 4,  SCL 5
+// Nextion:                  Serial2 RX 16, TX 17
+// AS5600 encoder:           ADC1 GPIO36 (must stay on ADC1 - ADC2 shares
+//                           the WiFi radio and is unusable while the AP
+//                           is up)
+// Torso/head Cytron motor:  PWM 12, DIR 13
+// Leg/foot motor (digital): PWM 25, DIR 26
+// Remote 74HC165:           LATCH 27, CLOCK 14, DATA 19
+const int REMOTE_LATCH_PIN = 27;
+const int REMOTE_CLOCK_PIN = 14;
+const int REMOTE_DATA_PIN  = 19; // INPUT_PULLDOWN - defaults to 0 if tether breaks
+
+#define LEG_MOTOR_PWM_PIN 25
+#define LEG_MOTOR_DIR_PIN 26
+
+#define MOTOR_PWM_PIN 12
+#define MOTOR_DIR_PIN 13
+
+#define ENCODER_PIN 36
+
+// ===================================================================
+// WIFI / WEB DASHBOARD (lowest priority)
+// ===================================================================
 const char* ssid = "MediTilt_Pro_Net";
 const char* password = "clinicalcontrol"; // min 8 chars
 
@@ -51,24 +115,66 @@ int footAngle = 0;
 int leftTilt = 0;
 int rightTilt = 0;
 
-// Control mode: false = Nextion touch is active (default, physical presses
-// work); true = blink mode is active (USB blink bytes drive navigation,
-// physical Nextion touch is locked out via tsw so fingers do nothing).
+// false = Nextion physical touch active; true = blink mode (USB bytes
+// drive nav, physical touch locked via tsw).
 bool blinkModeEnabled = true;
 
-// Nextion-vs-web arbiter: any Nextion activity (USB blink byte or a real
-// H-command from the screen) locks the web API out for this many ms.
-unsigned long lastNextionActivityMillis = 0;
-const unsigned long NEXTION_PRIORITY_COOLDOWN_MS = 8000; // temporarily longer for easy manual testing
+// ===================================================================
+// PRIORITY ARBITRATION
+// ===================================================================
+// Remote: highest priority. Any remote activity (manual jog on ANY axis,
+// or an active homing sequence, or the kill switch) locks out both
+// Nextion and web for this many ms after the activity stops, to avoid
+// a lower-priority source snatching the motor the instant a button is
+// released.
+unsigned long lastRemoteActivityMillis = 0;
+const unsigned long REMOTE_PRIORITY_COOLDOWN_MS = 2000;
 
-void markNextionActive() {
-  lastNextionActivityMillis = millis();
+// Nextion: mid priority. Locks out web for this many ms after any
+// Nextion activity (physical H-command or blink nav triggering one).
+unsigned long lastNextionActivityMillis = 0;
+const unsigned long NEXTION_PRIORITY_COOLDOWN_MS = 8000; // long for easy bench testing; tighten for production
+
+volatile bool emergencyStopActive = false;
+volatile bool headManualJogActive = false;
+
+bool isHomingActive = false;
+int homingStage = 0; // 0 Idle, 1 Tilt(sim), 2 Leg(sim), 3 Head(physical)
+unsigned long homingTimer = 0;
+
+void markRemoteActive() { lastRemoteActivityMillis = millis(); }
+void markNextionActive() { lastNextionActivityMillis = millis(); }
+
+// True whenever the remote outranks everything else and Nextion/web
+// commands to the torso motor must be refused.
+bool remoteHasPriority() {
+  if (emergencyStopActive) return true;
+  if (headManualJogActive) return true;
+  if (isHomingActive) return true;
+  return (millis() - lastRemoteActivityMillis) < REMOTE_PRIORITY_COOLDOWN_MS;
 }
 
+// True whenever Nextion outranks web (remote is assumed already clear
+// by the caller - check remoteHasPriority() first).
 bool nextionHasPriority() {
   return (millis() - lastNextionActivityMillis) < NEXTION_PRIORITY_COOLDOWN_MS;
 }
 
+// Remote button-state edge tracking
+int lastHeadState = 0;
+int lastLegState = 0;
+int lastTiltState = 0;
+bool lastKillState = false;
+
+unsigned long lastRemoteBlinkTime = 0;
+bool remoteLedState = HIGH;
+
+unsigned long lastDebugPrintMillis = 0;
+const unsigned long DEBUG_PRINT_INTERVAL_MS = 250;
+
+// ===================================================================
+// WEB DASHBOARD HTML (unchanged from source - self-contained page)
+// ===================================================================
 const char html_page[] PROGMEM = R"=====(
 <!doctype html>
 <html lang="en">
@@ -224,7 +330,7 @@ const char html_page[] PROGMEM = R"=====(
         let headAngle = 0, footAngle = 0, leftTilt = 0, rightTilt = 0;
         const MAX_HEAD = 60, MAX_FOOT = 30, MAX_TILT = 25;
         let blinkActive = false;
-        
+
         const headSeg = document.getElementById("headSeg"), footSegContainer = document.getElementById("footSegContainer"), footFlapSeg = document.getElementById("footFlapSeg"), leftHalf = document.getElementById("leftHalf"), rightHalf = document.getElementById("rightHalf"), sagDisplay = document.getElementById("sagDisplay"), latDisplay = document.getElementById("latDisplay"), headPresetBtns = document.querySelectorAll("#headPresetGroup .btn.preset"), footPresetBtns = document.querySelectorAll("#footPresetGroup .btn.preset"), blinkToggle = document.getElementById("blinkToggle"), blinkPanel = document.getElementById("blinkPanel");
 
         const statusBanner = document.getElementById("statusBanner");
@@ -239,10 +345,10 @@ const char html_page[] PROGMEM = R"=====(
           fetch(path, { method: "GET" })
             .then(res => res.text())
             .then(text => {
-              if (text.startsWith("BUSY")) {
+              if (text.startsWith("BUSY") || text.startsWith("ESTOP")) {
                 const match = text.match(/(\d+)\s*ms/);
                 const secs = match ? Math.ceil(parseInt(match[1], 10) / 1000) : null;
-                showBanner(secs ? `Nextion busy - try again in ${secs}s` : "Nextion busy - try again shortly", (secs || 3) * 1000);
+                showBanner(secs ? `${text.split(":")[0]} - try again in ${secs}s` : text, (secs || 3) * 1000);
               } else {
                 statusBanner.classList.remove("active");
               }
@@ -289,7 +395,7 @@ const char html_page[] PROGMEM = R"=====(
         let isDragging = false, activePart = null, startY = 0, startAngle = 0;
         function getClientY(e) { return e.touches ? e.touches[0].clientY : e.clientY; }
         function handleDragStart(part, initialAngle, e) { isDragging = true; activePart = part; startY = getClientY(e); startAngle = initialAngle; addDragClasses(); }
-        
+
         headSeg.addEventListener("mousedown", (e) => handleDragStart("head", headAngle, e));
         headSeg.addEventListener("touchstart", (e) => handleDragStart("head", headAngle, e));
         footSegContainer.addEventListener("mousedown", (e) => handleDragStart("foot", footAngle, e));
@@ -315,27 +421,43 @@ const char html_page[] PROGMEM = R"=====(
         }
         function handleDragEnd() { if (isDragging) { isDragging = false; activePart = null; setTimeout(removeDragClasses, 50); } }
         removeDragClasses(); headAngle = 0; footAngle = 0; refreshUI();
-        toggleBlink(true); // page loads with blink mode on, matching the checked switch
+        toggleBlink(true);
       })();
     </script>
   </body>
 </html>
 )=====";
 
-// Handler for the root web page URL "/"
 void handleRoot() {
   server.send(200, "text/html", html_page);
 }
 
-// PRIORITY 2: dropped while the Nextion side is active
+// PRIORITY 3 (lowest): dropped whenever remote OR Nextion outranks it.
 void handleAPI() {
-  // Mode toggle from the web dashboard's blink switch - always allowed,
-  // even while Nextion has priority, since this changes which input
-  // method is active rather than commanding a movement.
+  // Mode toggle - always allowed, it only changes which input method is
+  // active, it never commands a movement, so it doesn't need arbitration.
   if (server.hasArg("blinkMode")) {
     blinkModeEnabled = server.arg("blinkMode").toInt() == 1;
     applyTouchModeForCurrentPage();
     server.send(200, "text/plain", blinkModeEnabled ? "BLINK_MODE_ON" : "BLINK_MODE_OFF");
+    return;
+  }
+
+  if (emergencyStopActive) {
+    Serial.println("[BLOCKED] Web command ignored - E-STOP active");
+    server.send(200, "text/plain", "ESTOP: system halted, release kill switch first");
+    return;
+  }
+
+  if (remoteHasPriority()) {
+    unsigned long remaining = REMOTE_PRIORITY_COOLDOWN_MS - (millis() - lastRemoteActivityMillis);
+    // headManualJogActive / isHomingActive have no fixed end time, so just
+    // report a nominal window in that case rather than a bogus countdown.
+    if (headManualJogActive || isHomingActive) remaining = REMOTE_PRIORITY_COOLDOWN_MS;
+    Serial.print("[BLOCKED] Web command ignored - remote has priority for ");
+    Serial.print(remaining);
+    Serial.println(" ms");
+    server.send(200, "text/plain", "BUSY: remote control active, try again in " + String(remaining) + " ms");
     return;
   }
 
@@ -352,31 +474,27 @@ void handleAPI() {
   bool motorCommand = false;
   float requestedRoll = 0.0;
 
-  // head drives the real motor
   if (server.hasArg("head")) {
     headAngle = server.arg("head").toInt();
     updated = true;
     motorCommand = true;
     requestedRoll = headAngle;
   }
-
-  // Display-only axes (no motor wired to these yet)
   if (server.hasArg("foot")) {
     footAngle = server.arg("foot").toInt();
     updated = true;
   }
   if (server.hasArg("leftTilt")) {
     leftTilt = server.arg("leftTilt").toInt();
-    if (leftTilt > 0) rightTilt = 0; // Balance constraint check
+    if (leftTilt > 0) rightTilt = 0;
     updated = true;
   }
   if (server.hasArg("rightTilt")) {
     rightTilt = server.arg("rightTilt").toInt();
-    if (rightTilt > 0) leftTilt = 0; // Balance constraint check
+    if (rightTilt > 0) leftTilt = 0;
     updated = true;
   }
 
-  // Log state to Serial
   if (updated) {
     Serial.println("--- BED STATE UPDATE (WEB) ---");
     Serial.printf("Head Angle : %d deg\n", headAngle);
@@ -386,24 +504,28 @@ void handleAPI() {
     Serial.println("------------------------------\n");
   }
 
-  // Only head moves the motor
   if (motorCommand) {
     Serial.println("[SOURCE: WEB]");
     setBedTarget(requestedRoll);
   }
 
-  // Respond to browser
   server.send(200, "text/plain", "OK");
 }
 
-// MPU6050 (IMU)
+// ===================================================================
+// MPU6050 (IMU) - complementary filter + fixed mount-offset correction
+// ===================================================================
 #define MPU6050_ADDR 0x68
-
 int16_t AcX, AcY, AcZ;
 int16_t GyX, GyY, GyZ;
 
 const float ACC_SCALE  = 16384.0;
 const float GYRO_SCALE = 131.0;
+
+// Fixed mechanical mounting correction (see original comment in the
+// remote sketch for calibration procedure). Applied everywhere roll is
+// computed, so it stays correct even if the bed boots while not flat.
+const float IMU_ROLL_MOUNT_OFFSET_DEG = -1.2;
 
 float accOffsetX = 0, accOffsetY = 0, accOffsetZ = 0;
 float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
@@ -426,31 +548,31 @@ class ComplementaryFilter {
 ComplementaryFilter cFilterRoll;
 ComplementaryFilter cFilterPitch;
 
-// Nextion navigation state
-int hoverColor = 1055;     // Custom Blue highlight
-int defaultColor = 65535;  // Default normal button color (White)
-
-int currentPage = 0;
-int currentIndex = 0;
-
-String page0_btns[] = {"b1", "b6", "b2", "b0"};
-String page1_btns[] = {"b1", "b2", "b3", "b4", "b0"};
-String page2_btns[] = {"b9", "b10", "b0"};
-
-const int page0_size = 4;
-const int page1_size = 5;
-const int page2_size = 3;
-
-// AS5600 encoder
-#define ENCODER_PIN 36
+// ===================================================================
+// AS5600 ENCODER (with light noise mitigation - see header note re: WiFi AP)
+// ===================================================================
 const unsigned long ENCODER_SAMPLE_INTERVAL_MS = 4;
 unsigned long lastEncoderMillis = 0;
 
 volatile long rotations = 0;
 float lastAngle = 0;
 
+// 3-sample median of analogRead to knock down single-sample ADC spikes
+// (WiFi radio activity is a known noise source on this pin). This does
+// NOT fix the underlying issue, it just makes single-sample glitches
+// less likely to register as a full wraparound event below.
+int readEncoderRawMedian() {
+  int a = analogRead(ENCODER_PIN);
+  int b = analogRead(ENCODER_PIN);
+  int c = analogRead(ENCODER_PIN);
+  if (a > b) { int t = a; a = b; b = t; }
+  if (b > c) { int t = b; b = c; c = t; }
+  if (a > b) { int t = a; a = b; b = t; }
+  return b; // median
+}
+
 void readEncoder() {
-  int raw = analogRead(ENCODER_PIN);
+  int raw = readEncoderRawMedian();
   float angle = (raw / 4095.0) * 360.0;
   float diff = angle - lastAngle;
 
@@ -464,17 +586,34 @@ void readEncoder() {
   lastAngle = angle;
 }
 
-// Cytron motor driver
-#define MOTOR_PWM_PIN 12
-#define MOTOR_DIR_PIN 13
-
+// ===================================================================
+// TORSO/HEAD MOTOR (Cytron MD30C) - shared by remote/Nextion/web
+// Direction convention: DIR_PIN=LOW is "increasing" (see header note #1)
+// ===================================================================
 const int MOTOR_SPEED = 255;
 long targetRotations = 0;
 bool motorMoving = false;
 
+// Extra encoder "rotations" of motor-shaft travel needed to take up
+// mechanical slack in the torso leadscrew whenever the motor reverses
+// direction. Tune on the bench per the original comment: jog up/down/up
+// and count rotations before the bed visibly moves again after a reversal.
+const long BACKLASH_COMPENSATION = 6;
+
+// Inside this many rotations of target, motor drops to MOTOR_SPEED_SLOW
+// to avoid overshoot between 4ms encoder polls.
+const long HOMING_SLOWDOWN_ZONE = 15;
+const int  MOTOR_SPEED_SLOW     = 90;
+
+// Last direction the torso motor actually drove: +1 increasing, -1
+// decreasing, 0 unknown. Persists across stops (including manual jog and
+// Nextion/web commanded stops) so the next move - regardless of source -
+// knows whether it needs to pay the backlash toll.
+int8_t torsoLastDirection = 0;
+
 void motorStop() { analogWrite(MOTOR_PWM_PIN, 0); }
-void motorDriveIncreasing() { digitalWrite(MOTOR_DIR_PIN, HIGH); analogWrite(MOTOR_PWM_PIN, MOTOR_SPEED); }
-void motorDriveDecreasing() { digitalWrite(MOTOR_DIR_PIN, LOW); analogWrite(MOTOR_PWM_PIN, MOTOR_SPEED); }
+void motorDriveIncreasing(int spd = MOTOR_SPEED) { digitalWrite(MOTOR_DIR_PIN, LOW); analogWrite(MOTOR_PWM_PIN, spd); }
+void motorDriveDecreasing(int spd = MOTOR_SPEED) { digitalWrite(MOTOR_DIR_PIN, HIGH); analogWrite(MOTOR_PWM_PIN, spd); }
 
 void setupMotor() {
   pinMode(MOTOR_PWM_PIN, OUTPUT);
@@ -482,6 +621,249 @@ void setupMotor() {
   motorStop();
 }
 
+long applyBacklashCompensation(long rawTarget) {
+  int8_t neededDir = (rawTarget > rotations) ? 1 : (rawTarget < rotations ? -1 : 0);
+
+  if (neededDir != 0 && torsoLastDirection != 0 && neededDir != torsoLastDirection) {
+    rawTarget += (long)neededDir * BACKLASH_COMPENSATION;
+    Serial.print("[BACKLASH COMP] Direction reversal -> adding ");
+    Serial.print(BACKLASH_COMPENSATION);
+    Serial.println(" rotations of slack take-up to target.");
+  }
+
+  // rotations is hard-clamped at 0 in readEncoder(), so a compensated
+  // target below 0 could never actually be reached.
+  if (rawTarget < 0) rawTarget = 0;
+
+  return rawTarget;
+}
+
+// ===================================================================
+// LEG/FOOT MOTOR - remote-only, open-loop, digital bypass (no PWM)
+// ===================================================================
+void legMotorStop()      { digitalWrite(LEG_MOTOR_PWM_PIN, LOW); }
+void legMotorDriveUp()   { digitalWrite(LEG_MOTOR_DIR_PIN, LOW); digitalWrite(LEG_MOTOR_PWM_PIN, HIGH); }
+void legMotorDriveDown() { digitalWrite(LEG_MOTOR_DIR_PIN, HIGH);  digitalWrite(LEG_MOTOR_PWM_PIN, HIGH); }
+
+void setupLegMotor() {
+  pinMode(LEG_MOTOR_PWM_PIN, OUTPUT);
+  pinMode(LEG_MOTOR_DIR_PIN, OUTPUT);
+  legMotorStop();
+}
+
+void commandLegManual(int dir) {
+  if (dir == lastLegState) return;
+  lastLegState = dir;
+  if (dir != 0) markRemoteActive();
+
+  if (emergencyStopActive) { legMotorStop(); return; }
+
+  if (dir == 1) { Serial.println("CMD: LEG RAISING (real motor, open-loop)..."); legMotorDriveUp(); }
+  else if (dir == -1) { Serial.println("CMD: LEG LOWERING (real motor, open-loop)..."); legMotorDriveDown(); }
+  else { Serial.println("CMD: LEG STOPPED."); legMotorStop(); }
+}
+
+void commandHeadManual(int dir) {
+  if (dir == lastHeadState) return;
+  lastHeadState = dir;
+  if (dir != 0) markRemoteActive();
+
+  if (emergencyStopActive) { motorStop(); headManualJogActive = false; return; }
+
+  if (dir == 1) {
+    Serial.println("CMD: HEAD/TORSO LIFTING (real motor, manual jog - REMOTE)...");
+    headManualJogActive = true;
+    motorMoving = false;
+    motorDriveIncreasing();
+    torsoLastDirection = 1;
+  } else if (dir == -1) {
+    Serial.println("CMD: HEAD/TORSO LOWERING (real motor, manual jog - REMOTE)...");
+    headManualJogActive = true;
+    motorMoving = false;
+    motorDriveDecreasing();
+    torsoLastDirection = -1;
+  } else {
+    Serial.println("CMD: HEAD/TORSO STOPPED (remote release).");
+    motorStop();
+    headManualJogActive = false;
+    targetRotations = rotations; // discard any stale Nextion/web target
+    markRemoteActive(); // start the priority-hold window on release too
+  }
+}
+
+void commandTiltSim(int dir) {
+  if (dir == lastTiltState) return;
+  lastTiltState = dir;
+  if (dir != 0) markRemoteActive();
+
+  if (dir == 1) Serial.println("CMD: SIDE TILT -> RAISING LEFT [SIMULATED - no tilt motor installed]");
+  else if (dir == 2) Serial.println("CMD: SIDE TILT -> RAISING RIGHT (pushing Left to 0) [SIMULATED]");
+  else Serial.println("CMD: SIDE TILT STOPPED. [SIMULATED]");
+}
+
+void haltAllMotorsHard() {
+  motorStop();
+  motorMoving = false;
+  headManualJogActive = false;
+  targetRotations = rotations;
+  legMotorStop();
+  lastHeadState = 0;
+  lastLegState = 0;
+  commandTiltSim(0);
+  // torsoLastDirection intentionally NOT reset - mechanical slack state
+  // survives a hard stop, next move still needs to know which way it
+  // last actually drove.
+}
+
+// ===================================================================
+// REMOTE: HOMING SEQUENCE (physical, closed-loop on stage 3)
+// ===================================================================
+void updateHomingSimulation() {
+  if (!isHomingActive) return;
+  markRemoteActive();
+
+  if (emergencyStopActive) {
+    Serial.println("[ HOMING ABORTED ] Kill switch engaged.");
+    isHomingActive = false;
+    homingStage = 0;
+    return;
+  }
+
+  unsigned long currentMillis = millis();
+
+  if (homingStage == 1) {
+    if (currentMillis - homingTimer > 2000) {
+      Serial.println("HOMING Step 1 Complete [SIMULATED]. Now zeroing leg axis...");
+      homingStage = 2;
+      homingTimer = currentMillis;
+    }
+  } else if (homingStage == 2) {
+    if (currentMillis - homingTimer > 2000) {
+      Serial.println("HOMING Step 2 Complete [SIMULATED]. Activating physical closed-loop homing for Head/Torso (Target: 0 deg)...");
+      long rawTarget = rollToRotations(0.0);
+      targetRotations = applyBacklashCompensation(rawTarget);
+      motorMoving = true;
+      headManualJogActive = false;
+      homingStage = 3;
+      homingTimer = currentMillis;
+    }
+  } else if (homingStage == 3) {
+    if (!motorMoving) {
+      Serial.println("[ HOMING COMPLETE ] Head/Torso zeroed via closed-loop encoder tracking. System safe.");
+      isHomingActive = false;
+      homingStage = 0;
+    }
+  }
+}
+
+// ===================================================================
+// REMOTE: 74HC165 shift register polling (PRIORITY 1)
+// ===================================================================
+void updateRemoteLED(bool isCommandActive) {
+  if (isCommandActive) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastRemoteBlinkTime >= 100) {
+      lastRemoteBlinkTime = currentMillis;
+      remoteLedState = !remoteLedState;
+      digitalWrite(LED_BUILTIN, remoteLedState);
+    }
+  } else if (remoteLedState != HIGH) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    remoteLedState = HIGH;
+  }
+}
+
+byte read74HC165() {
+  byte value = 0;
+  for (int i = 0; i < 8; ++i) {
+    int bitValue = digitalRead(REMOTE_DATA_PIN);
+    value |= (bitValue << (7 - i));
+    digitalWrite(REMOTE_CLOCK_PIN, HIGH);
+    delayMicroseconds(5); // 5us for 1-meter cable stability
+    digitalWrite(REMOTE_CLOCK_PIN, LOW);
+  }
+  return value;
+}
+
+void pollRemote() {
+  static unsigned long lastRemotePoll = 0;
+  unsigned long now = millis();
+  if (now - lastRemotePoll < 15) return;
+  lastRemotePoll = now;
+
+  digitalWrite(REMOTE_LATCH_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(REMOTE_LATCH_PIN, HIGH);
+  byte state = read74HC165();
+
+  bool btnHoming    = bitRead(state, 0);
+  bool btnRightUp   = bitRead(state, 1);
+  bool btnLegUp     = bitRead(state, 2);
+  bool btnHeadUp    = bitRead(state, 3);
+  bool btnHeadDown  = bitRead(state, 4);
+  bool btnLegDown   = bitRead(state, 5);
+  bool btnLeftUp    = bitRead(state, 6);
+  bool btnKill      = bitRead(state, 7);
+
+  bool isMoving = (btnHeadUp || btnHeadDown || btnLegUp || btnLegDown ||
+                    btnLeftUp || btnRightUp || isHomingActive);
+
+  if (isMoving) markRemoteActive();
+
+  // --- PRIORITY 1a: GLOBAL KILL SWITCH (outranks everything, incl. Nextion/web) ---
+  if (btnKill) {
+    if (!lastKillState) {
+      Serial.println("\n[ !!! EMERGENCY KILL SWITCH ACTIVATED !!! ]");
+      lastKillState = true;
+    }
+    emergencyStopActive = true;
+    isHomingActive = false;
+    homingStage = 0;
+    haltAllMotorsHard();
+    markRemoteActive();
+    digitalWrite(LED_BUILTIN, LOW);
+    return;
+  } else if (lastKillState) {
+    Serial.println("[ KILL SWITCH RELEASED - System Ready ]");
+    lastKillState = false;
+    emergencyStopActive = false;
+    markRemoteActive(); // hold priority briefly after release
+    digitalWrite(LED_BUILTIN, HIGH);
+  }
+
+  updateRemoteLED(isMoving);
+
+  // --- PRIORITY 1b: HOMING SEQUENCE ---
+  if (btnHoming && !isHomingActive) {
+    Serial.println("\n[ HOMING SEQUENCE INITIATED ] Executing multi-axis systemic reset...");
+    isHomingActive = true;
+    homingStage = 1;
+    homingTimer = millis();
+    haltAllMotorsHard();
+  }
+
+  if (isHomingActive) {
+    updateHomingSimulation();
+    return; // hard lock manual inputs during homing
+  }
+
+  // --- PRIORITY 1c: MANUAL AXIS JOG ---
+  if (btnHeadUp) commandHeadManual(1);
+  else if (btnHeadDown) commandHeadManual(-1);
+  else commandHeadManual(0);
+
+  if (btnLegUp) commandLegManual(1);
+  else if (btnLegDown) commandLegManual(-1);
+  else commandLegManual(0);
+
+  if (btnLeftUp) commandTiltSim(1);
+  else if (btnRightUp) commandTiltSim(2);
+  else commandTiltSim(0);
+}
+
+// ===================================================================
+// CALIBRATION LOOKUP (shared by remote homing, Nextion, and web)
+// ===================================================================
 long rollToRotations(float targetRoll) {
   float rollFirst = pgm_read_float(&calRoll[0]);
   float rollLast  = pgm_read_float(&calRoll[CAL_TABLE_SIZE - 1]);
@@ -510,40 +892,77 @@ long rollToRotations(float targetRoll) {
   return pgm_read_dword(&calRotations[CAL_TABLE_SIZE - 1]);
 }
 
+// ===================================================================
+// SHARED CLOSED-LOOP MOTOR CONTROL (backlash-aware + creep speed).
+// Services whichever target was last legitimately set - by remote
+// homing, Nextion, or web - since all three now go through the same
+// applyBacklashCompensation() path via setBedTarget() / homing stage 2.
+// ===================================================================
 void updateMotorControl() {
 #if SIMULATE_MOTOR
-  return; // no real driving in simulation mode - setBedTarget() logs instead
+  return;
 #endif
+  if (emergencyStopActive) { motorStop(); motorMoving = false; return; }
+  if (headManualJogActive) return; // remote manual jog owns the motor directly
   if (!motorMoving) return;
 
-  // Moves TOWARD the target safely
-  if (rotations > targetRotations) {
-    motorDriveIncreasing();
-  } else if (rotations < targetRotations) {
-    motorDriveDecreasing();
-  } else {
+  long error = targetRotations - rotations;
+
+  if (error == 0) {
     motorStop();
     motorMoving = false;
-    Serial.print("\n[SUCCESS] Target reached. Rotations: "); Serial.print(rotations);
+    Serial.print("\n[SUCCESS] Position reached. Rotations: "); Serial.print(rotations);
     Serial.print(" | Active Roll: "); Serial.println(roll, 2);
+    return;
+  }
+
+  int speed = (labs(error) <= HOMING_SLOWDOWN_ZONE) ? MOTOR_SPEED_SLOW : MOTOR_SPEED;
+
+  if (error > 0) {
+    motorDriveIncreasing(speed);
+    torsoLastDirection = 1;
+  } else {
+    motorDriveDecreasing(speed);
+    torsoLastDirection = -1;
   }
 }
 
+// Entry point used by BOTH Nextion (interpretBedCommand) and web
+// (handleAPI) to request a torso angle. Callers are responsible for
+// doing their own priority checks BEFORE calling this - this function
+// just converts angle -> backlash-compensated target and arms the motor.
 void setBedTarget(float targetAngle) {
 #if SIMULATE_MOTOR
-  targetRotations = rollToRotations(targetAngle);
-  motorMoving = false; // "arrives" instantly, nothing to poll for in loop()
+  targetRotations = applyBacklashCompensation(rollToRotations(targetAngle));
+  motorMoving = false;
   Serial.print("\n[SIMULATED MOTOR] Would move to angle: "); Serial.print(targetAngle, 2);
   Serial.print(" deg -> target rotations: "); Serial.println(targetRotations);
   return;
 #endif
-  targetRotations = rollToRotations(targetAngle);
+  long rawTarget = rollToRotations(targetAngle);
+  targetRotations = applyBacklashCompensation(rawTarget);
   motorMoving = true;
   Serial.print("\n>>> New target angle: "); Serial.print(targetAngle, 2);
   Serial.print(" deg -> Target rotations: "); Serial.println(targetRotations);
 }
 
-// Nextion navigation logic
+// ===================================================================
+// NEXTION NAVIGATION / TOUCH LOGIC (PRIORITY 2)
+// ===================================================================
+int hoverColor = 1055;
+int defaultColor = 65535;
+
+int currentPage = 0;
+int currentIndex = 0;
+
+String page0_btns[] = {"b1", "b6", "b2", "b0"};
+String page1_btns[] = {"b1", "b2", "b3", "b4", "b0"};
+String page2_btns[] = {"b9", "b10", "b0"};
+
+const int page0_size = 4;
+const int page1_size = 5;
+const int page2_size = 3;
+
 String getCurrentButtonID() {
   if (currentPage == 0) return page0_btns[currentIndex];
   if (currentPage == 1) return page1_btns[currentIndex];
@@ -559,7 +978,7 @@ void highlightCurrentButton(int colorCode) {
   String target = getCurrentButtonID();
   Serial2.print(target + ".bco=" + String(colorCode));
   endNextionCmd();
-  Serial2.print("ref " + target);   // <-- forces the display to redraw
+  Serial2.print("ref " + target);
   endNextionCmd();
 }
 
@@ -573,10 +992,6 @@ void clearAllButtonsOnPage() {
   }
 }
 
-// Locks or unlocks physical finger presses on the Nextion for whichever
-// page is currently showing. tsw only disables real touch input - it does
-// NOT block the "click" command, so handleNext()/handleSelect() (blink
-// navigation) keep working even while a person's actual touches are locked.
 void applyTouchModeForCurrentPage() {
   bool touchEnabled = !blinkModeEnabled;
   String* btns;
@@ -625,7 +1040,6 @@ void handleSelect() {
   if (pageChanged) {
     Serial2.print("page page" + String(nextExecutionPage));
     endNextionCmd();
-
     delay(250);
     currentPage = nextExecutionPage;
     currentIndex = 0;
@@ -637,6 +1051,10 @@ void handleSelect() {
   }
 }
 
+// Actual bed-angle requests arriving from the Nextion screen (either a
+// direct physical touch or a blink-triggered click on an angle button)
+// funnel through here. This is the single choke point where remote
+// priority is enforced against Nextion.
 void interpretBedCommand(String cmd) {
   char foundCommand = ' ';
   for (int i = 0; i < cmd.length() - 1; i++) {
@@ -646,17 +1064,53 @@ void interpretBedCommand(String cmd) {
     }
   }
 
-  if (foundCommand == '0')      { Serial.println("[SOURCE: NEXTION]"); setBedTarget(0.0);  markNextionActive(); }
-  else if (foundCommand == '1') { Serial.println("[SOURCE: NEXTION]"); setBedTarget(15.0);  markNextionActive(); }
-  else if (foundCommand == '2') { Serial.println("[SOURCE: NEXTION]"); setBedTarget(30.0);  markNextionActive(); }
-  else if (foundCommand == '3') { Serial.println("[SOURCE: NEXTION]"); setBedTarget(60.0);  markNextionActive(); }
-  else {
+  if (foundCommand == '0' || foundCommand == '1' || foundCommand == '2' || foundCommand == '3') {
+    if (emergencyStopActive) {
+      Serial.println("[BLOCKED] Nextion command ignored - E-STOP active");
+      return;
+    }
+    if (remoteHasPriority()) {
+      Serial.println("[BLOCKED] Nextion command ignored - remote has priority");
+      return;
+    }
+
+    markNextionActive();
+    Serial.println("[SOURCE: NEXTION]");
+    if (foundCommand == '0') setBedTarget(0.0);
+    else if (foundCommand == '1') setBedTarget(15.0);
+    else if (foundCommand == '2') setBedTarget(30.0);
+    else if (foundCommand == '3') setBedTarget(60.0);
+  } else {
     Serial.print("Command acknowledged. Length: ");
     Serial.println(cmd.length());
   }
 }
 
-// Sensor setup helpers
+// ===================================================================
+// DEBUG STATUS (combined)
+// ===================================================================
+void printDebugStatus() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastDebugPrintMillis < DEBUG_PRINT_INTERVAL_MS) return;
+  lastDebugPrintMillis = currentMillis;
+
+  const char* source = "IDLE";
+  if (emergencyStopActive) source = "ESTOP";
+  else if (headManualJogActive) source = "REMOTE-JOG";
+  else if (isHomingActive) source = "REMOTE-HOMING";
+  else if (remoteHasPriority()) source = "REMOTE-HOLD";
+  else if (nextionHasPriority()) source = "NEXTION";
+  else if (motorMoving) source = "WEB/AUTO";
+
+  Serial.print("[STATUS] Src: "); Serial.print(source);
+  Serial.print(" | Rotations: "); Serial.print(rotations);
+  Serial.print(" | Target: "); Serial.print(targetRotations);
+  Serial.print(" | Roll: "); Serial.println(roll, 2);
+}
+
+// ===================================================================
+// SENSOR SETUP HELPERS
+// ===================================================================
 void setupMPU() {
   Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x6B); Wire.write(0x00); Wire.endTransmission(true);
   Wire.beginTransmission(MPU6050_ADDR); Wire.write(0x1C); Wire.write(0x00); Wire.endTransmission(true);
@@ -696,12 +1150,14 @@ void calibrateMPU() {
   gyroOffsetZ = (float)gz / samples;
 }
 
-// Setup & loop
+// ===================================================================
+// SETUP
+// ===================================================================
 void setup() {
   Serial.begin(115200);
   Serial2.begin(9600, SERIAL_8N1, 16, 17);
   delay(1000);
-  Serial.println("\nInitializing MediTilt Pro System (Nextion + Web, merged)...");
+  Serial.println("\nInitializing MediTilt Pro (Remote > Nextion > Web, fully merged)...");
 
 #if SIMULATE_MOTOR
   Serial.println("[SIMULATION] Skipping MPU6050 init/calibration - no IMU connected");
@@ -716,7 +1172,7 @@ void setup() {
   float ax = AcX - accOffsetX;
   float ay = AcY - accOffsetY;
   float az = AcZ - accOffsetZ;
-  cFilterRoll.angle  = atan2(ay, az) * 180.0 / PI;
+  cFilterRoll.angle  = (atan2(ay, az) * 180.0 / PI) - IMU_ROLL_MOUNT_OFFSET_DEG;
   cFilterPitch.angle = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
   lastMicros = micros();
 
@@ -724,6 +1180,17 @@ void setup() {
 #endif
 
   setupMotor();
+  setupLegMotor();
+
+  // Remote shift register
+  pinMode(REMOTE_LATCH_PIN, OUTPUT);
+  pinMode(REMOTE_CLOCK_PIN, OUTPUT);
+  digitalWrite(REMOTE_LATCH_PIN, HIGH);
+  pinMode(REMOTE_DATA_PIN, INPUT_PULLDOWN); // defaults to 0 if tether breaks
+  digitalWrite(REMOTE_CLOCK_PIN, LOW);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
 
   int raw = analogRead(ENCODER_PIN);
   lastAngle = (raw / 4095.0) * 360.0;
@@ -733,7 +1200,7 @@ void setup() {
   highlightCurrentButton(hoverColor);
   applyTouchModeForCurrentPage();
 
-  // --- Wi-Fi / Web server bring-up ---
+  // WiFi AP + web server (see header note #2 re: GPIO36 noise)
   WiFi.softAP(ssid, password);
   Serial.println("Access Point Started!");
   Serial.print("SSID: ");
@@ -745,38 +1212,33 @@ void setup() {
   server.on("/api", handleAPI);
   server.begin();
   Serial.println("HTTP Web Server Started, ready for connections.");
+
+  Serial.println("Physical remote subsystem online and armed (top priority).");
 }
 
-unsigned long lastStatusPrintMillis = 0;
-const unsigned long STATUS_PRINT_INTERVAL_MS = 500; // how often to print IMU/rotation status
-
-void printStatus() {
-  Serial.print("IMU Roll: ");        Serial.print(roll, 2);
-  Serial.print(" | Current Rotations: "); Serial.print(rotations);
-  Serial.print(" | Target Rotations: "); Serial.println(targetRotations);
-}
-
+// ===================================================================
+// LOOP
+// ===================================================================
 void loop() {
   unsigned long currentMillis = millis();
 
-  // Periodic status print (IMU roll + rotation info)
-  if (currentMillis - lastStatusPrintMillis >= STATUS_PRINT_INTERVAL_MS) {
-    lastStatusPrintMillis = currentMillis;
-    printStatus();
-  }
-
-  // Encoder sample
+  // Unconditional encoder polling
   if (currentMillis - lastEncoderMillis >= ENCODER_SAMPLE_INTERVAL_MS) {
     lastEncoderMillis = currentMillis;
     readEncoder();
   }
 
-  // Blink commands from Python over USB (priority 1, only when blink mode is on)
+  // PRIORITY 1: hardware remote (kill switch / homing / manual jog)
+  pollRemote();
+
+  // PRIORITY 2: Nextion - USB blink navigation bytes
   if (Serial.available() > 0) {
     char incomingChar = Serial.read();
     Serial.print("[USB RX] Got byte: "); Serial.println(incomingChar);
     if (!blinkModeEnabled) {
       Serial.println("[IGNORED] Blink mode is off - Nextion touch mode is active");
+    } else if (remoteHasPriority()) {
+      Serial.println("[BLOCKED] Blink nav ignored - remote has priority");
     } else {
       markNextionActive();
       if (incomingChar == '0') {
@@ -789,16 +1251,16 @@ void loop() {
     }
   }
 
-  // Physical Nextion screen presses (priority 1)
+  // PRIORITY 2: Nextion - physical screen presses (H-commands over Serial2)
   if (Serial2.available() > 0) {
     String incomingCmd = Serial2.readStringUntil('\n');
     incomingCmd.trim();
     if (incomingCmd.length() > 0) {
-      interpretBedCommand(incomingCmd);
+      interpretBedCommand(incomingCmd); // internally checks remoteHasPriority()
     }
   }
 
-  // IMU sample (20ms)
+  // IMU update (20ms interval)
 #if !SIMULATE_MOTOR
   static unsigned long lastSampleMillis = 0;
   if (currentMillis - lastSampleMillis >= 20) {
@@ -813,7 +1275,7 @@ void loop() {
     float gxRate = (GyX - gyroOffsetX) / GYRO_SCALE;
     float gyRate = (GyY - gyroOffsetY) / GYRO_SCALE;
 
-    float rollAcc  = atan2(ay, az) * 180.0 / PI;
+    float rollAcc  = (atan2(ay, az) * 180.0 / PI) - IMU_ROLL_MOUNT_OFFSET_DEG;
     float pitchAcc = atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
 
     roll  = cFilterRoll.update(gxRate, rollAcc, dt);
@@ -821,8 +1283,13 @@ void loop() {
   }
 #endif
 
+  // Shared closed-loop motor service (drives whatever legitimate target
+  // is currently armed - remote homing, Nextion, or web - with backlash
+  // compensation and creep-speed baked in)
   updateMotorControl();
 
-  // Web dashboard (priority 2, gated inside handleAPI())
+  printDebugStatus();
+
+  // PRIORITY 3: web dashboard (gated internally inside handleAPI())
   server.handleClient();
 }
