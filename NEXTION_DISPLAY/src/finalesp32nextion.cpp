@@ -1,9 +1,13 @@
-// --- UI COLOR SETTINGS ---
+#include <Arduino.h>
+#include <Wire.h>
+// #include "calibration_table.h" // Uncomment when you add this file to your 'include' folder
+
+//========================================================================
+// 1. UI COLOR SETTINGS & NAVIGATION TRACKING
+//========================================================================
 int hoverColor = 1055;     // Custom Blue highlight
 int defaultColor = 65535;  // Default normal button color
-// -------------------------
 
-// State Tracking for Navigation
 int currentPage = 0;   
 int currentIndex = 0;  
 
@@ -16,73 +20,56 @@ const int page0_size = 4;
 const int page1_size = 5;
 const int page2_size = 3;
 
-// Forward declaration of functions
+//========================================================================
+// 2. LOCKOUT TIMER VARIABLES (PHYSICAL REMOTE)
+//========================================================================
+unsigned long lockoutStartTime = 0;
+bool isScreenLocked = false;
+const unsigned long lockoutDuration = 5000; // 5 seconds
+
+//========================================================================
+// 3. MPU6050 (IMU) CONFIGURATION
+//========================================================================
+#define MPU6050_ADDR 0x68
+int16_t AcX, AcY, AcZ, GyX, GyY, GyZ;
+const float ACC_SCALE  = 16384.0;
+const float GYRO_SCALE = 131.0;
+float accOffsetX = 0, accOffsetY = 0, accOffsetZ = 0;
+unsigned long lastMicros = 0;
+
+//========================================================================
+// 4. FORWARD DECLARATIONS (REQUIRED FOR PLATFORMIO)
+//========================================================================
 void endNextionCmd();
-void clearAllButtonsOnPage();
+void lockScreen();
+void unlockScreen();
+String getCurrentButtonID();
 void highlightCurrentButton(int colorCode);
+void clearAllButtonsOnPage();
+void handleNext();
+void handleSelect();
+bool remoteIsPressed();
+void readEncoder();
+void interpretBedCommand(String cmd);
+void readMPU();
 
-void setup() {
-  // Serial to PC (Python connects here)
-  Serial.begin(115200); 
-  
-  // Serial to Nextion Display
-  Serial2.begin(9600, SERIAL_8N1, 16, 17); 
-
-  delay(2000); 
-
-  // Force wipe the screen to clear any stuck buttons, then highlight the first
-  clearAllButtonsOnPage();
-  highlightCurrentButton(hoverColor); 
+//========================================================================
+// 5. NEXTION HARDWARE COMMUNICATION HELPERS
+//========================================================================
+void endNextionCmd() {
+  Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
 }
 
-void loop() {
-  // 1. CHECK FOR BLINKS FROM PYTHON SCRIPT (Over USB)
-  if (Serial.available() > 0) {
-    char incomingChar = Serial.read();
-    
-    if (incomingChar == '0') {
-      handleNext();
-    } 
-    else if (incomingChar == '1') {
-      handleSelect();
-    }
-  }
-
-  // 2. CHECK FOR INCOMING BED COMMANDS FROM NEXTION
-  if (Serial2.available() > 0) {
-    String incomingCmd = Serial2.readStringUntil('\n');
-    incomingCmd.trim(); 
-
-    if (incomingCmd.length() > 0) {
-      interpretBedCommand(incomingCmd);
-    }
-  }
+void lockScreen() {
+  Serial2.print("vis pBusy,1"); endNextionCmd();
+  Serial2.print("tsw 255,0");   endNextionCmd();
 }
 
-// --------------------------------------------------------
-// INCOMING NEXTION COMMAND INTERPRETER
-// --------------------------------------------------------
-void interpretBedCommand(String cmd) {
-  // Prints back to Python for debugging
-  Serial.println("\n[HARDWARE COMMAND RECEIVED]: " + cmd);
-
-  if (cmd == "H0")      Serial.println("Moving Torso Actuator to 0 DEG (FLAT)");
-  else if (cmd == "H1") Serial.println("Moving Torso Actuator to 15 DEG");
-  else if (cmd == "H2") Serial.println("Moving Torso Actuator to 30 DEG");
-  else if (cmd == "H3") Serial.println("Moving Torso Actuator to 60 DEG");
-  else if (cmd == "L0") Serial.println("Moving Lower Body Actuator to 0 DEG (FLAT)");
-  else if (cmd == "L1") Serial.println("Moving Lower Body Actuator to 15 DEG");
-  else if (cmd == "L2") Serial.println("Moving Lower Body Actuator to 30 DEG");
-  else if (cmd == "L3") Serial.println("Moving Lower Body Actuator to 60 DEG");
-  else if (cmd == "T0") Serial.println("Resetting Lateral Tilt to FLAT");
-  else if (cmd == "T1") Serial.println("Executing Left Side Lateral Tilt to 15 DEG");
-  else if (cmd == "R0") Serial.println("Resetting Lateral Tilt to FLAT");
-  else if (cmd == "R1") Serial.println("Executing Right Side Lateral Tilt to 15 DEG");
+void unlockScreen() {
+  Serial2.print("vis pBusy,0"); endNextionCmd();
+  Serial2.print("tsw 255,1");   endNextionCmd();
 }
 
-// --------------------------------------------------------
-// CORE NAVIGATION HELPER FUNCTIONS
-// --------------------------------------------------------
 String getCurrentButtonID() {
   if (currentPage == 0) return page0_btns[currentIndex];
   if (currentPage == 1) return page1_btns[currentIndex];
@@ -90,58 +77,130 @@ String getCurrentButtonID() {
   return "";
 }
 
-void endNextionCmd() {
-  Serial2.write(0xFF); Serial2.write(0xFF); Serial2.write(0xFF);
-}
-
 void highlightCurrentButton(int colorCode) {
-  String target = getCurrentButtonID();
-  Serial2.print(target + ".bco=" + String(colorCode));
-  endNextionCmd();
+  String btn = getCurrentButtonID();
+  if (btn != "") {
+    Serial2.print(btn + ".bco=" + String(colorCode));
+    endNextionCmd();
+  }
 }
 
 void clearAllButtonsOnPage() {
   if (currentPage == 0) {
-    for (int i = 0; i < page0_size; i++) {
-      Serial2.print(page0_btns[i] + ".bco=" + String(defaultColor));
-      endNextionCmd();
-    }
-  } 
-  else if (currentPage == 1) {
-    for (int i = 0; i < page1_size; i++) {
-      Serial2.print(page1_btns[i] + ".bco=" + String(defaultColor));
-      endNextionCmd();
-    }
-  } 
-  else if (currentPage == 2) {
-    for (int i = 0; i < page2_size; i++) {
-      Serial2.print(page2_btns[i] + ".bco=" + String(defaultColor));
-      endNextionCmd();
-    }
+    for (int i = 0; i < page0_size; i++) { Serial2.print(page0_btns[i] + ".bco=" + String(defaultColor)); endNextionCmd(); }
+  } else if (currentPage == 1) {
+    for (int i = 0; i < page1_size; i++) { Serial2.print(page1_btns[i] + ".bco=" + String(defaultColor)); endNextionCmd(); }
+  } else if (currentPage == 2) {
+    for (int i = 0; i < page2_size; i++) { Serial2.print(page2_btns[i] + ".bco=" + String(defaultColor)); endNextionCmd(); }
   }
 }
 
-void handleNext() {
-  // Un-highlight current button
-  highlightCurrentButton(defaultColor); 
+//========================================================================
+// 6. SETUP
+//========================================================================
+void setup() {
+  Serial.begin(115200);                    // PC / Python Blinks
+  Serial2.begin(9600, SERIAL_8N1, 16, 17); // Nextion TX/RX (ESP32 Pins 16/17)
+  Wire.begin(4, 5);                        // I2C for MPU6050 (ESP32 Pins 4/5)
 
-  // Advance the index
+  delay(2000); // Allow Nextion to boot
+
+  clearAllButtonsOnPage();
+  highlightCurrentButton(hoverColor); 
+}
+
+//========================================================================
+// 7. MAIN LOOP (NON-BLOCKING STATE MACHINE)
+//========================================================================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // --- A. PHYSICAL REMOTE & LOCKOUT LOGIC ---
+  bool remoteActive = remoteIsPressed(); 
+
+  if (remoteActive) { 
+    if (!isScreenLocked) {
+      lockScreen();          
+      isScreenLocked = true;
+      Serial.println("Remote active: Screen locked.");
+    }
+    lockoutStartTime = millis(); // Constantly reset stopwatch while held
+  }
+
+  // Check if remote is released AND 5 seconds have passed
+  if (isScreenLocked && (millis() - lockoutStartTime >= lockoutDuration)) {
+    unlockScreen();          
+    isScreenLocked = false;
+    Serial.println("Lockout ended: Screen unlocked.");
+  }
+
+  // --- B. READ ENCODER (10ms Loop) ---
+  static unsigned long lastEncoderMillis = 0;
+  if (currentMillis - lastEncoderMillis >= 10) {
+    lastEncoderMillis = currentMillis;
+    readEncoder();
+  }
+
+  // --- C. BLINK DETECTION (USB SERIAL FROM PYTHON) ---
+  if (Serial.available() > 0) {
+    char incomingChar = Serial.read();
+    
+    // SAFETY CHECK: Only process blinks if screen is unlocked
+    if (!isScreenLocked) {
+      if (incomingChar == '0') {
+        handleNext();           
+        Serial.println("ACK:0");
+      } else if (incomingChar == '1') {
+        handleSelect();         
+        Serial.println("ACK:1");
+      }
+    } else {
+      Serial.println("Blink ignored: Remote lockout is active.");
+    }
+  }
+
+  // --- D. NEXTION TOUCH SCREEN EVENTS (UART) ---
+  if (Serial2.available() > 0) {
+    String incomingCmd = Serial2.readStringUntil('\n');
+    incomingCmd.trim();
+    if (incomingCmd.length() > 0) {
+      interpretBedCommand(incomingCmd);
+    }
+  }
+
+  // --- E. MPU6050 PHYSICS ENGINE (20ms Loop) ---
+  static unsigned long lastSampleMillis = 0;
+  if (currentMillis - lastSampleMillis >= 20) {
+    lastSampleMillis = currentMillis;
+    readMPU();
+    
+    unsigned long now = micros();
+    float dt = (now - lastMicros) / 1000000.0;
+    lastMicros = now;
+
+    // TODO: Add your IMU math and PID motor driving logic here
+  }
+}
+
+//========================================================================
+// 8. ACTION HANDLERS & STUBS
+//========================================================================
+void handleNext() {
+  highlightCurrentButton(defaultColor); 
+  
   currentIndex++;
   if (currentPage == 0 && currentIndex >= page0_size) currentIndex = 0;
   if (currentPage == 1 && currentIndex >= page1_size) currentIndex = 0;
   if (currentPage == 2 && currentIndex >= page2_size) currentIndex = 0;
-
-  // Highlight the new button
+  
   highlightCurrentButton(hoverColor); 
 }
 
 void handleSelect() {
   String target = getCurrentButtonID();
-
-  // Clear current highlight
   highlightCurrentButton(defaultColor); 
 
-  // Simulate Nextion click
+  // Simulate Nextion click (Press down, wait, release)
   Serial2.print("click " + target + ",1"); endNextionCmd();
   delay(100); 
   Serial2.print("click " + target + ",0"); endNextionCmd();
@@ -156,13 +215,30 @@ void handleSelect() {
     if (target == "b0") { currentPage = 0; pageChanged = true; }
   }
 
-  // Handle page transitions
   if (pageChanged) {
-    delay(250); 
-    currentIndex = 0;
-    clearAllButtonsOnPage(); // Wipe the new page clean
-    highlightCurrentButton(hoverColor);
-  } else {
-    highlightCurrentButton(hoverColor);
+     currentIndex = 0;
+     delay(200); 
+     clearAllButtonsOnPage();
   }
+  highlightCurrentButton(hoverColor); 
+}
+
+// --- HARDWARE LOGIC STUBS ---
+// Replace the insides of these functions with your actual sensor/motor code
+
+bool remoteIsPressed() {
+  // TODO: Add your 74HC165 shift register read logic here
+  return false; 
+}
+
+void readEncoder() {
+  // TODO: Add your AS5600 logic here
+}
+
+void interpretBedCommand(String cmd) {
+  // TODO: Add your motor command parser here
+}
+
+void readMPU() {
+  // TODO: Add your Wire.h MPU6050 request logic here
 }
